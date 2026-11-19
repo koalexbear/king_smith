@@ -42,6 +42,7 @@ class WalkingPadApi:
         self.status: TreadmillStatus | None = None
         self._last_status_time = 0.0
         self._step_cadence = 0.0
+        self._pending_speed: float | None = None
         self.speed_adjustment_step = 0.5
 
     def _measurement(self, field: str) -> float | int | None:
@@ -129,6 +130,15 @@ class WalkingPadApi:
     def _on_status_update(self, status: TreadmillStatus) -> None:
         """Snapshot mutable library status before notifying listeners."""
         previous = self.status
+        if getattr(status, "has_speed", True):
+            reached_target = self._pending_speed is not None and math.isclose(
+                status.speed, self._pending_speed, abs_tol=1e-6
+            )
+            stopped = (
+                previous is not None and previous.speed > 0 and status.speed == 0
+            )
+            if reached_target or stopped:
+                self._pending_speed = None
         self._step_cadence = 0.0
         if previous is not None and previous.speed > 0 and status.speed > 0:
             elapsed = status.duration - previous.duration
@@ -147,6 +157,7 @@ class WalkingPadApi:
 
     def _on_disconnect(self) -> None:
         """Notify listeners immediately when the BLE link closes."""
+        self._pending_speed = None
         for callback in tuple(self._disconnect_callbacks):
             callback()
 
@@ -154,6 +165,7 @@ class WalkingPadApi:
         """Connect using a fresh device reference from Home Assistant."""
         if self.connected:
             return
+        self._pending_speed = None
         if self._ctrl is not None:
             await self._ctrl.disconnect()
         device = self._resolve_device()
@@ -180,6 +192,7 @@ class WalkingPadApi:
     async def disconnect(self) -> None:
         """Release the BLE connection."""
         async with self._lock:
+            self._pending_speed = None
             if self._ctrl is not None:
                 await self._ctrl.disconnect()
 
@@ -199,6 +212,22 @@ class WalkingPadApi:
         async with self._lock:
             try:
                 await self._connect()
+                if command == "adjust_speed":
+                    current = self._pending_speed
+                    if current is None:
+                        current = self.speed
+                    if current is None:
+                        raise HomeAssistantError(
+                            "Cannot adjust speed before a speed report is received"
+                        )
+                    target = (
+                        max(self.min_speed, current)
+                        + args[0] * self.speed_adjustment_step
+                    )
+                    target = min(self.max_speed, max(self.min_speed, target))
+                    increments = round(target / self.speed_increment)
+                    args = (round(increments * self.speed_increment, 10),)
+                    command = "set_speed"
                 if command == "set_speed":
                     speed = args[0]
                     if not self.min_speed <= speed <= self.max_speed:
@@ -214,6 +243,7 @@ class WalkingPadApi:
                     if not await self._ctrl.switch_mode(OperatingMode.MANUAL):
                         raise HomeAssistantError("The treadmill rejected manual mode")
                 if command == "sleep":
+                    self._pending_speed = None
                     if not self.profile.supports(Capability.SLEEP):
                         raise HomeAssistantError("Sleep is not supported by this model")
                     if self.profile.sleep_strategy == SleepStrategy.STANDBY:
@@ -226,14 +256,27 @@ class WalkingPadApi:
                     if self.moving and not await self._ctrl.stop():
                         raise HomeAssistantError("The treadmill did not confirm stop")
                     await asyncio.sleep(0.4)
-                if not await getattr(self._ctrl, command)(*args):
-                    raise HomeAssistantError(f"The treadmill did not confirm {command}")
+                if command in ("start", "stop"):
+                    self._pending_speed = None
+                if command == "set_speed":
+                    # Keep the target separate from measured speed. A report
+                    # arriving during the write can already confirm the target.
+                    self._pending_speed = args[0]
+                try:
+                    if not await getattr(self._ctrl, command)(*args):
+                        raise HomeAssistantError(
+                            f"The treadmill did not confirm {command}"
+                        )
+                except BaseException:
+                    self._pending_speed = None
+                    raise
                 if command == "stop" and self._ctrl.protocol == ProtocolType.WILINK:
                     if not await self._ctrl.switch_mode(OperatingMode.STANDBY):
                         raise HomeAssistantError("The treadmill rejected standby mode")
                 if self._ctrl.protocol == ProtocolType.WILINK:
                     await self._ctrl.update_state()
             except (BleakError, TimeoutError, RuntimeError) as error:
+                self._pending_speed = None
                 if not self.connected:
                     self._on_disconnect()
                 raise HomeAssistantError(
@@ -262,11 +305,7 @@ class WalkingPadApi:
         await self._command("set_speed", speed)
 
     async def adjust_speed(self, direction: int) -> None:
-        """Change speed by the user-selected adjustment step."""
+        """Queue an adjustment relative to the pending target or measured speed."""
         if direction not in (-1, 1):
             raise ValueError("Direction must be -1 or 1")
-        current = max(self.min_speed, self.speed or 0)
-        target = current + direction * self.speed_adjustment_step
-        target = min(self.max_speed, max(self.min_speed, target))
-        increments = round(target / self.speed_increment)
-        await self.change_speed(round(increments * self.speed_increment, 10))
+        await self._command("adjust_speed", direction)

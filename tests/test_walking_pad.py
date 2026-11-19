@@ -112,6 +112,120 @@ async def test_speed_buttons_stay_within_profile_limits(api_and_controller):
     controller.set_speed.assert_awaited_once_with(6.0)
 
 
+@pytest.mark.parametrize("direction,expected", [(1, 3.5), (-1, 2.5)])
+async def test_speed_buttons_follow_pending_slider_target(
+    api_and_controller, direction, expected
+):
+    """Do not calculate either button from telemetry predating a slider command."""
+    api, controller = api_and_controller
+    api._on_status_update(TreadmillStatus(speed=1.0))
+    await api.change_speed(3.0)
+    api._on_status_update(TreadmillStatus(speed=1.2))
+    await api.adjust_speed(direction)
+    assert [call.args[0] for call in controller.set_speed.await_args_list] == [
+        3.0, expected
+    ]
+    assert api.speed == 1.2
+
+
+async def test_queued_speed_buttons_accumulate(api_and_controller):
+    """Calculate each rapid press after the preceding command has completed."""
+    api, controller = api_and_controller
+    api._on_status_update(TreadmillStatus(speed=2.0))
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def set_speed(value):
+        if value == 3.0:
+            entered.set()
+            await release.wait()
+        return True
+
+    controller.set_speed.side_effect = set_speed
+    slider = asyncio.create_task(api.change_speed(3.0))
+    await entered.wait()
+    faster1 = asyncio.create_task(api.adjust_speed(1))
+    faster2 = asyncio.create_task(api.adjust_speed(1))
+    slower = asyncio.create_task(api.adjust_speed(-1))
+    release.set()
+    await asyncio.gather(slider, faster1, faster2, slower)
+    assert [call.args[0] for call in controller.set_speed.await_args_list] == [
+        3.0, 3.5, 4.0, 3.5
+    ]
+
+
+async def test_confirmed_target_allows_later_remote_speed_changes(api_and_controller):
+    """Return to measured speed once the device has reached our target."""
+    api, controller = api_and_controller
+    api._on_status_update(TreadmillStatus(speed=1.0))
+    await api.change_speed(3.0)
+    api._on_status_update(TreadmillStatus(speed=3.0))
+    api._on_status_update(TreadmillStatus(speed=2.0))
+    await api.adjust_speed(1)
+    assert controller.set_speed.await_args_list[-1].args == (2.5,)
+
+
+async def test_target_confirmation_during_write_is_retained(api_and_controller):
+    """Do not reinstate a pending target after its report arrived during a write."""
+    api, controller = api_and_controller
+    api._on_status_update(TreadmillStatus(speed=1.0))
+
+    async def set_speed(value):
+        api._on_status_update(TreadmillStatus(speed=value))
+        return True
+
+    controller.set_speed.side_effect = set_speed
+    await api.change_speed(3.0)
+    api._on_status_update(TreadmillStatus(speed=2.0))
+    await api.adjust_speed(1)
+    assert controller.set_speed.await_args_list[-1].args == (2.5,)
+
+
+@pytest.mark.parametrize("failure", [False, BleakError("write failed"), asyncio.CancelledError()])
+async def test_failed_speed_command_does_not_seed_next_adjustment(
+    api_and_controller, failure
+):
+    """Drop an unconfirmed command target after rejection, failure or cancellation."""
+    api, controller = api_and_controller
+    api._on_status_update(TreadmillStatus(speed=2.0))
+    if failure is False:
+        controller.set_speed.return_value = False
+    else:
+        controller.set_speed.side_effect = failure
+    error = asyncio.CancelledError if isinstance(failure, asyncio.CancelledError) else HomeAssistantError
+    with pytest.raises(error):
+        await api.change_speed(5.0)
+    controller.set_speed.side_effect = None
+    controller.set_speed.return_value = True
+    await api.adjust_speed(1)
+    assert controller.set_speed.await_args_list[-1].args == (2.5,)
+
+
+@pytest.mark.parametrize("reset", ["start", "stop", "sleep", "disconnect", "remote_stop"])
+async def test_pending_speed_is_reset_between_sessions(api_and_controller, reset):
+    """Do not carry a speed target across stopping, sleeping or disconnecting."""
+    api, controller = api_and_controller
+    api._on_status_update(TreadmillStatus(speed=2.0))
+    await api.change_speed(5.0)
+    if reset == "disconnect":
+        api._on_disconnect()
+    elif reset == "remote_stop":
+        api._on_status_update(TreadmillStatus(speed=0.0))
+    else:
+        await api._command(reset)
+    api._on_status_update(TreadmillStatus(speed=1.0))
+    await api.adjust_speed(1)
+    assert controller.set_speed.await_args_list[-1].args == (1.5,)
+
+
+async def test_unknown_speed_does_not_default_to_minimum(api_and_controller):
+    """Require a measured starting point rather than guessing a low speed."""
+    api, controller = api_and_controller
+    with pytest.raises(HomeAssistantError, match="speed report"):
+        await api.adjust_speed(1)
+    controller.set_speed.assert_not_awaited()
+
+
 async def test_sleep_stops_a_moving_ftms_pad_first(api_and_controller):
     """Match the KS Fit exit sequence before entering vendor sleep mode."""
     api, controller = api_and_controller

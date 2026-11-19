@@ -82,6 +82,13 @@ size entity. Its range is 0.1–1.0 km/h, its default is 0.5 km/h, and Home Assi
 selected value after a restart. Changes are clamped to the model profile's safe
 speed limits.
 
+While a speed change is still pending, the Increase/Decrease buttons adjust the
+last requested target instead of an older measured speed. Rapid presses are
+calculated in command-queue order. Once a speed report reaches that target,
+subsequent adjustments follow the reported speed again, including changes made
+with the physical remote. Pending targets are cleared on stop, sleep, start,
+disconnect, or a failed speed write; displayed speed remains device-reported.
+
 The separate Sleep button stops the belt if necessary and then puts the Z1 into
 its low-power mode. Wake the Z1 with its physical remote.
 
@@ -168,6 +175,15 @@ The protocol implementation uses
 [walkingpad-controller](https://github.com/mcdax/walkingpad-controller). The Z1
 unlock sequence is documented by
 [z1-walkingpad-mcp](https://github.com/slandau3/z1-walkingpad-mcp#how-it-works-the-protocol).
+
+For legacy WiLink devices such as the A1 Pro, the integration spaces Bluetooth
+writes by at least the underlying library's minimum interval (currently 690 ms),
+including mode changes and status requests. This works around a timing error in
+`ph4-walkingpad` 1.0.2 that can send consecutive commands too close together.
+Connection establishment uses `bleak-retry-connector` with Home Assistant's
+discovered Bluetooth device. Belt commands themselves are not automatically
+retried. Enable `custom_components.king_smith.wilink` and `ph4_walkingpad.pad`
+debug logging to inspect outgoing commands and incoming WiLink reports.
 
 ## Manual installation
 

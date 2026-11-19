@@ -12,6 +12,7 @@ from walkingpad_controller.ftms import FTMSController
 from walkingpad_controller.models import TreadmillStatus
 
 from .device_profile import Capability, DeviceProfile, resolve_profile
+from .wilink import KingsmithWiLinkController
 
 _LOGGER = logging.getLogger(__name__)
 SUPPLEMENT_NOTIFY_UUID = "24e2521c-f63b-48ed-85be-c5330b00fdf7"
@@ -151,6 +152,17 @@ class KingsmithController(WalkingPadController):
             await self._ftms.connect(self._ble_device)
         except BaseException:
             await self._ftms.disconnect()
+            raise
+
+    async def _connect_wilink(self) -> None:
+        """Use paced WiLink writes and proxy-aware connection retries."""
+        self._wilink = KingsmithWiLinkController()
+        self._wilink.register_status_callback(self._on_status_update)
+        self._wilink.register_disconnect_callback(self._on_disconnect)
+        try:
+            await self._wilink.connect(self._ble_device)
+        except BaseException:
+            await self._wilink.disconnect()
             raise
 
     async def sleep(self) -> bool:
